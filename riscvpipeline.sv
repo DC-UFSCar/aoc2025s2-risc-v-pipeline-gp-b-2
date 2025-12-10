@@ -58,12 +58,34 @@ module riscvpipeline (
    wire [31:0] jumpOrBranchAddress;
    wire        jumpOrBranch;
 
-   always @(posedge clk) begin
-      FD_instr <= Instr;
+   // --- STALL LOGIC DECLARATION (Used in Fetch and Decode) ---
+    // Detecta Load-Use Hazard: Instrução no estágio Execute é Load e o destino dela 
+    // é usado como fonte pela instrução no estágio Decode (que é FD_instr aqui).
+    wire stall; 
+    // Nota: A logica de stall precisa checar a instrução que está SAINDO do decode (DE_instr)
+    // contra a que está ENTRANDO (FD_instr). Mas DE_instr é definido no bloco D.
+    // Vamos definir a logica de stall mais abaixo e usar aqui.
+
+    always @(posedge clk) begin
+       // FLUSH: Se jumpOrBranch for 1, precisamos "matar" a instrução que acabou de ser buscada.
+       // STALL: Se stall for 1, não atualizamos o PC e mantemos o pipeline register.
+
+       if (!stall) begin 
+           FD_instr <= jumpOrBranch ? NOP : Instr; // Se branch tomado, descarta a inst buscada (Flush)
       FD_PC    <= F_PC;
-      F_PC     <= F_PC + 4;
+           
       if (jumpOrBranch)
-    	   F_PC     <= jumpOrBranchAddress;
+              F_PC <= jumpOrBranchAddress;
+           else
+              F_PC <= F_PC + 4;
+       end else begin
+           // Durante o stall, mantemos os valores de FD (simulando a bolha acima)
+           // e não incrementamos o PC.
+           FD_instr <= FD_instr;
+           FD_PC    <= FD_PC;
+           F_PC     <= F_PC; 
+       end
+
       FD_nop <= reset;
       if (reset)
     	   F_PC <= 0;
@@ -81,11 +103,41 @@ module riscvpipeline (
    wire [4:0]  wbRdId;
 
    reg [31:0] RegisterBank [0:31];
+ // --- STALL LOGIC IMPLEMENTATION ---
+    // Stall acontece quando a instrução em DE (agora em Execute) é um Load
+    // E a instrução em FD (agora em Decode) usa o registrador de destino do Load.
+    assign stall = isLoad(DE_instr) && (
+        (rs1Id(FD_instr) == rdId(DE_instr) && readsRs1(FD_instr) && rdId(DE_instr) != 0) ||
+        (rs2Id(FD_instr) == rdId(DE_instr) && readsRs2(FD_instr) && rdId(DE_instr) != 0)
+    );
+
+    // --- REGISTER FILE BYPASS (Write-First) ---
+    // Verifica se estamos escrevendo e lendo o mesmo registrador no mesmo ciclo.
+    wire [31:0] bypass_rs1 = (writeBackEn && wbRdId != 0 && wbRdId == rs1Id(FD_instr)) ? writeBackData : RegisterBank[rs1Id(FD_instr)];
+    wire [31:0] bypass_rs2 = (writeBackEn && wbRdId != 0 && wbRdId == rs2Id(FD_instr)) ? writeBackData : RegisterBank[rs2Id(FD_instr)];
+
    always @(posedge clk) begin
       DE_PC    <= FD_PC;
-      DE_instr <= FD_nop ? NOP : FD_instr;
-      DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
-      DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
+       
+       // Priority: Reset > Flush (Jump) > Stall
+       if (FD_nop || reset) begin
+           DE_instr <= NOP;
+       end else if (jumpOrBranch) begin
+           // FLUSH: Se o branch foi tomado no Execute, a instrução que estava em Decode
+           // (indo para Execute agora) deve ser anulada.
+           DE_instr <= NOP;
+       end else if (stall) begin
+           // STALL: Inserimos uma bolha (NOP) para o estágio Execute, 
+           // permitindo que o Load no estágio Memory termine.
+           DE_instr <= NOP;
+       end else begin
+           DE_instr <= FD_instr;
+       end
+       
+       // Leitura dos registradores com Bypass
+       DE_rs1 <= rs1Id(FD_instr) ? bypass_rs1 : 32'b0;
+       DE_rs2 <= rs2Id(FD_instr) ? bypass_rs2 : 32'b0;
+
       if (writeBackEn)
 	      RegisterBank[wbRdId] <= writeBackData;
    end
@@ -96,9 +148,38 @@ module riscvpipeline (
    reg [31:0] EM_rs2;
    reg [31:0] EM_Eresult;
    reg [31:0] EM_addr;
-   wire [31:0] E_aluIn1 = DE_rs1;
-   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? DE_rs2 : Iimm(DE_instr);
-   wire [4:0]  E_shamt  = isALUreg(DE_instr) ? DE_rs2[4:0] : shamt(DE_instr);
+   
+    // --- FORWARDING LOGIC ---
+    // Precisamos saber se as instruções nos estágios M e W escrevem em registradores
+    wire [4:0] E_rs1Id = rs1Id(DE_instr);
+    wire [4:0] E_rs2Id = rs2Id(DE_instr);
+    
+    // Sinais vindos dos estágios M e W (via pipe regs ou regs de saida)
+    wire [4:0] M_rdId = rdId(EM_instr);
+    wire M_writesRd = writesRd(EM_instr);
+    wire [4:0] W_rdId = rdId(MW_instr); // MW_instr vem do estágio M->W
+    wire W_writesRd = writesRd(MW_instr);
+
+    // Seleção dos dados com Forwarding
+    // Prioridade: Memory Stage (mais recente) > Writeback Stage > Valor Original (DE)
+    
+    // Forwarding para RS1
+    wire [31:0] E_aluIn1_fwd = 
+        (M_writesRd && M_rdId != 0 && M_rdId == E_rs1Id) ? EM_Eresult :
+        (W_writesRd && W_rdId != 0 && W_rdId == E_rs1Id) ? writeBackData :
+        DE_rs1;
+
+    // Forwarding para RS2 (Usado tanto para ALU quanto para Store Data)
+    wire [31:0] E_aluIn2_fwd = 
+        (M_writesRd && M_rdId != 0 && M_rdId == E_rs2Id) ? EM_Eresult :
+        (W_writesRd && W_rdId != 0 && W_rdId == E_rs2Id) ? writeBackData :
+        DE_rs2;
+
+   wire [31:0] E_aluIn1 = E_aluIn1_fwd;
+   // O Mux do imediato deve acontecer APÓS o forwarding do RS2
+    wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? E_aluIn2_fwd : Iimm(DE_instr);
+    
+    wire [4:0]  E_shamt  = isALUreg(DE_instr) ? E_aluIn2_fwd[4:0] : shamt(DE_instr); // Cuidado: shift amount usa rs2
    wire E_minus = DE_instr[30] & isALUreg(DE_instr);
    wire E_arith_shift = DE_instr[30];
 
@@ -123,6 +204,13 @@ module riscvpipeline (
    endfunction
 
    wire [31:0] E_shifter_in = funct3(DE_instr) == 3'b001 ? flip32(E_aluIn1) : E_aluIn1;
+   // Usar E_aluIn2[4:0] para shift imediato ou reg, mas precisamos garantir que usamos o valor correto
+   // Se for immediate shift (SRAI, SRLI), shamt vem da instrução. Se for Reg (SRA, SRL), vem de rs2.
+   // O codigo original usava E_aluIn2[4:0], que já passou pelo Mux do Iimm.
+   // Porém, para Shifts tipo R, E_aluIn2 contem rs2 forwarded. Para Shifts tipo I, contem Iimm.
+   // O shift amount deve ser pego corretamente.
+   wire [4:0] shift_amount = isALUreg(DE_instr) ? E_aluIn2_fwd[4:0] : shamt(DE_instr);
+
    wire [31:0] E_shifter = $signed({E_arith_shift & E_aluIn1[31], E_shifter_in}) >>> E_aluIn2[4:0];
    wire [31:0] E_leftshift = flip32(E_shifter);
 
@@ -171,13 +259,13 @@ module riscvpipeline (
 	isAUIPC(DE_instr)                    ? DE_PC + Uimm(DE_instr) :
                                           E_aluOut               ;
 
-   always @(posedge clk) begin
-      EM_PC      <= DE_PC;
-      EM_instr   <= DE_instr;
-      EM_rs2     <= DE_rs2;
+  always @(posedge clk) begin
+       EM_PC    <= DE_PC;
+       EM_instr <= DE_instr; // Flush/Stall handled in Decode regarding instr passing
+       EM_rs2   <= E_aluIn2_fwd; // Store Data must be the Forwarded Value!
       EM_Eresult <= E_result;
-      EM_addr    <= isStore(DE_instr) ? DE_rs1 + Simm(DE_instr) :
-                                        DE_rs1 + Iimm(DE_instr) ;
+       EM_addr  <= isStore(DE_instr) ? E_aluIn1_fwd + Simm(DE_instr) :
+                                       E_aluIn1_fwd + Iimm(DE_instr) ;
    end
 
 /************************ M: Memory *******************************************/
